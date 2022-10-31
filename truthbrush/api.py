@@ -205,6 +205,10 @@ class Api:
 
         return self._get(f"/v1/truth/ads?device={device}")
 
+    def hashtags(self, tag):
+        self.__check_login()
+        return self._get(f"/v1/timelines/tag/{tag}")
+
     def user_followers(
         self,
         user_handle: str = None,
