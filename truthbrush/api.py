@@ -1,5 +1,6 @@
+import configparser
 from time import sleep
-from typing import Any, Iterator, List, Optional
+from typing import Any, Iterator, Optional, Generator
 from loguru import logger
 from requests.sessions import HTTPAdapter
 from dateutil import parser as date_parse
@@ -9,14 +10,7 @@ import requests
 import json
 import logging
 import os
-
-logging.basicConfig(
-    level=(
-        logging.DEBUG
-        if os.getenv("DEBUG") and os.getenv("DEBUG").lower() != "false"
-        else logging.INFO
-    )
-)
+from scrapingbee import ScrapingBeeClient
 
 BASE_URL = "https://truthsocial.com"
 API_BASE_URL = "https://truthsocial.com/api"
@@ -28,28 +22,129 @@ CLIENT_SECRET = "ozF8jzI4968oTKFkEnsBC-UbLPCdrSv0MkXGQu2o_-M"
 
 proxies = {"http": os.getenv("http_proxy"), "https": os.getenv("https_proxy")}
 
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+SCRAPER_API_BASE_URL = "http://api.scraperapi.com"
+
 
 class LoginErrorException(Exception):
     pass
 
 
-class Api:
-    def __init__(self, username: str = None, password: str = None):
+class TruthSocialClient:
+    def __init__(self, username: str = None, password: str = None, profile_section="main",
+                 config_fpath: str = None):
         self.ratelimit_max = 300
         self.ratelimit_remaining = None
         self.ratelimit_reset = None
-        self.__username = username
-        self.__password = password
-        self.auth_id = ""
+        self.user_account = username
+        self.user_password = password
+        self.access_token = ""
+        self.scrapping_bee_api_key = ""
+        self.headers: dict = {}
+
+        self.profile_section = profile_section
+        self.headers_section = 'headers'
+        if config_fpath:
+            self.config_fpath = config_fpath
+        else:
+            self.config_fpath = self.default_config()
+
+        if not self.user_account or not self.user_password:
+            self.load_credentials()
+
+        self.load_headers()
+
+        self.api_client = ScrapingBeeClient(api_key=self.scrapping_bee_api_key)
+
+    @staticmethod
+    def default_config():
+        """
+        Default config file path
+        """
+        return os.path.join(ROOT_DIR, "truthbrush/config", "truthsocial.ini")
+
+    def load_credentials(self):
+        """
+        Attempt to load gab info from config file
+        """
+        config_file_path = self.config_fpath
+        profile_section = self.profile_section
+        logging.info(f"loading profile {profile_section} from config {config_file_path}")
+
+        if not config_file_path or not os.path.isfile(config_file_path):
+            return {}
+
+        config = configparser.ConfigParser()
+        config.read(config_file_path)
+
+        if profile_section not in config.sections():
+            return {}
+
+        data = {}
+        for key in ['user_account', 'user_password', 'scrapping_bee_api_key']:
+            try:
+                setattr(self, key, config.get(profile_section, key))
+            except configparser.NoSectionError:
+                logging.error(f"no such profile {profile_section} in {config_file_path}")
+            except configparser.NoOptionError:
+                logging.error(f"missing {key} from profile {profile_section} in {config_file_path}")
+        return data
+
+    def load_headers(self):
+        config = configparser.ConfigParser()
+        config.read(self.config_fpath)
+        if self.headers_section not in config.sections():
+            user_agent = USER_AGENT
+            authorization = 'Bearer '
+        else:
+            user_agent = config.get('headers', 'user-agent')
+            authorization = config.get('headers', 'authorization')
+
+        headers = {
+            'user-agent': user_agent,
+            'authorization': authorization
+        }
+
+        setattr(self, 'headers', headers)
+
+        access_token = authorization.replace("Bearer ", "")
+        setattr(self, 'access_token', access_token)
+
+    def save_headers(self):
+        """
+        Save headers in the config file
+        """
+        if not self.config_fpath:
+            return
+        config = configparser.ConfigParser()
+        config.read(self.config_fpath)
+        if self.headers_section not in config.sections():
+            config.add_section(self.headers_section)
+
+        for k, v in self.headers.items():
+            config.set(self.headers_section, k, v)
+
+        with open(self.config_fpath, 'w') as config_file:
+            config.write(config_file)
+
+    def validate_access_token(self, url):
+        r = requests.get(url, headers=self.headers)
+        if r.status_code > 399:
+            self.access_token = ""
+        else:
+            self.access_token = self.headers.get("authorization", "").replace("Bearer ", "")
 
     def __check_login(self):
         """Runs before any login-walled function to check for login credentials and generates an auth ID token"""
-        if self.__username is None:
+        if self.user_account is None:
             raise LoginErrorException("Username is missing.")
-        if self.__password is None:
+        if self.user_password is None:
             raise LoginErrorException("Password is missing.")
-        if self.auth_id == "":
-            self.auth_id = self.get_auth_id(self.__username, self.__password)
+        if self.access_token == "":
+            self.access_token = self.get_access_token(self.user_account, self.user_password)
+            self.headers["authorization"] = f"Bearer {self.access_token}"
+            self.save_headers()
 
     def _make_session(self):
         s = requests.Session()
@@ -86,15 +181,25 @@ class Api:
             sleep(time_to_sleep)
 
     def _get(self, url: str, params: dict = None) -> Any:
-        resp = self._make_session().get(
-            API_BASE_URL + url,
-            params=params,
-            headers={
-                "authorization": "Bearer " + self.auth_id,
-                "user-agent": USER_AGENT,
-            },
-        )
+        full_url = API_BASE_URL + url
+        params = {"render_js": 'False', 'premium_proxy': 'True'}
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            'Authorization': "Bearer " + self.access_token
+        }
 
+        # resp = requests.get(
+        #     SCRAPER_API_BASE_URL,
+        #     params=payload,
+        #     headers={
+        #         "authorization": "Bearer " + self.access_token,
+        #         "user-agent": USER_AGENT,
+        #     },
+        # )
+
+        resp = self.api_client.get(full_url, params=params, headers=headers)
+
+        logging.info(f"url - {url}")
         # Will also sleep
         self._check_ratelimit(resp)
 
@@ -111,7 +216,7 @@ class Api:
                 next_link,
                 params=params,
                 headers={
-                    "authorization": "Bearer " + self.auth_id,
+                    "authorization": "Bearer " + self.access_token,
                     "user-agent": USER_AGENT,
                 },
             )
@@ -123,7 +228,7 @@ class Api:
             # Will also sleep
             self._check_ratelimit(resp)
 
-    def lookup(self, user_handle: str = None) -> Optional[dict]:
+    def lookup(self, user_handle: str = None) -> dict:
         """Lookup a user's information."""
 
         self.__check_login()
@@ -135,11 +240,11 @@ class Api:
         searchtype: str = None,
         query: str = None,
         limit: int = 40,
-        resolve: bool = 4,
+        resolve: int = 4,
         offset: int = 0,
         min_id: str = "0",
         max_id: str = None,
-    ) -> Optional[dict]:
+    ) -> Optional[Generator]:
         """Search users, statuses or hashtags."""
 
         self.__check_login()
@@ -205,9 +310,23 @@ class Api:
 
         return self._get(f"/v1/truth/ads?device={device}")
 
-    def hashtags(self, tag):
+    def data_by_tag(self, tag, max_id=None):
+        """Return a list of truths with a specific hashtag."""
+
+        url = f"/v1/timelines/tag/{tag}"
+        if max_id:
+            url += f"?max_id={max_id}"
+
         self.__check_login()
-        return self._get(f"/v1/timelines/tag/{tag}")
+        return self._get(url)
+
+    def home(self, max_id=None):
+        url = "/v1/timelines/home"
+        if max_id:
+            url += f"?max_id={max_id}"
+
+        self.__check_login()
+        return self._get(url)
 
     def user_followers(
         self,
@@ -253,11 +372,12 @@ class Api:
 
     def pull_statuses(
         self, username: str, created_after: date, replies: bool
-    ) -> List[dict]:
+    ) -> Optional[Generator]:
         """Pull the given user's statuses. Returns an empty list if not found."""
 
-        params = {}
-        id = self.lookup(username)["id"]
+        params: dict = {}
+        res = self.lookup(username)
+        id = res["id"]
         while True:
             try:
                 url = f"/v1/accounts/{id}/statuses"
@@ -307,7 +427,8 @@ class Api:
 
                 yield post
 
-    def get_auth_id(self, username: str, password: str) -> str:
+    @staticmethod
+    def get_access_token(username: str, password: str) -> str:
         """Logs in to Truth account and returns the session token"""
         url = BASE_URL + "/oauth/token"
         try:
@@ -331,7 +452,7 @@ class Api:
             sess_req.raise_for_status()
         except requests.exceptions.HTTPError as e:
             logger.error(f"Failed login request: {str(e)}")
-            return None
+            return ""
 
         if not sess_req.json()["access_token"]:
             raise ValueError("Invalid truthsocial.com credentials provided!")
